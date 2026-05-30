@@ -19,3 +19,6 @@ std = ["dep:anyhow"]
 model-mapper-macros = { workspace = true }
 
 anyhow = { workspace = true, optional = true }
+
+[dev-dependencies]
+thiserror = { workspace = true }

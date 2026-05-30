@@ -224,7 +224,11 @@ fn derive_struct_from(
     let into_body = into_ty_fields_helper
         .right_collector(|ix, f| {
             let ident = f.as_ident(ix);
-            f.build_into_for(true, is_try, &ident, original_from_ty)
+            if is_try {
+                quote!(#ident)
+            } else {
+                f.build_into_for(true, is_try, &ident, original_from_ty)
+            }
         })
         .collect();
 
@@ -269,6 +273,16 @@ fn derive_struct_from(
 
         // Implement the custom function
         if is_try {
+            let (trait_error_ty, is_accumulate, custom_accumulator, err_ty) = get_error_and_accumulate_info(Override::as_ref(from).explicit());
+            let try_body = build_try_body(
+                true,
+                original_from_ty,
+                struct_fields,
+                quote!(Self #into_body),
+                is_accumulate,
+                &custom_accumulator,
+                &err_ty,
+            );
             quote!(
                 #[automatically_derived]
                 #[allow(non_shorthand_field_patterns)]
@@ -276,9 +290,9 @@ fn derive_struct_from(
                     #[doc = #doc]
                     #[allow(clippy::too_many_arguments)]
                     pub fn #fn_name(from: #from_ty_with_generics, #( #external_fields ),*)
-                        -> ::std::result::Result<Self, ::anyhow::Error> {
+                        -> ::std::result::Result<Self, #trait_error_ty> {
                         let #from_ty #deconstructed_from = from;
-                        Ok(Self #into_body)
+                        #try_body
                     }
                 }
             )
@@ -297,17 +311,27 @@ fn derive_struct_from(
             )
         }
     } else if is_try {
+        let (trait_error_ty, is_accumulate, custom_accumulator, err_ty) = get_error_and_accumulate_info(Override::as_ref(from).explicit());
+        let try_body = build_try_body(
+            true,
+            original_from_ty,
+            struct_fields,
+            quote!(Self #into_body),
+            is_accumulate,
+            &custom_accumulator,
+            &err_ty,
+        );
         // Implement the [TryFrom] trait
         quote!(
             #[automatically_derived]
             #[allow(non_shorthand_field_patterns)]
             impl #impl_generics TryFrom<#from_ty_with_generics> for #into_ty #into_ty_generics #where_clause {
-                type Error = ::anyhow::Error;
+                type Error = #trait_error_ty;
 
                 fn try_from(from: #from_ty_with_generics)
                     -> ::std::result::Result<Self, <Self as TryFrom<#from_ty_with_generics>>::Error> {
                     let #from_ty #deconstructed_from = from;
-                    Ok(Self #into_body)
+                    #try_body
                 }
             }
         )
@@ -418,7 +442,11 @@ fn derive_struct_into(
             } else {
                 f.as_ident(ix)
             };
-            f.build_into_for(false, is_try, &ident, original_into_ty)
+            if is_try {
+                quote!(#ident)
+            } else {
+                f.build_into_for(false, is_try, &ident, original_into_ty)
+            }
         })
         .collect();
 
@@ -454,6 +482,16 @@ fn derive_struct_into(
 
         // Implement the custom function
         if is_try {
+            let (trait_error_ty, is_accumulate, custom_accumulator, err_ty) = get_error_and_accumulate_info(Override::as_ref(into).explicit());
+            let try_body = build_try_body(
+                false,
+                original_into_ty,
+                struct_fields,
+                quote!(#into_ty #into_body),
+                is_accumulate,
+                &custom_accumulator,
+                &err_ty,
+            );
             quote!(
                 #[automatically_derived]
                 #[allow(non_shorthand_field_patterns)]
@@ -461,9 +499,9 @@ fn derive_struct_into(
                     #[doc = #doc]
                     #[allow(clippy::too_many_arguments)]
                     pub fn #fn_name(self, #( #external_fields ),*)
-                        -> ::std::result::Result<#into_ty_with_generics, ::anyhow::Error> {
+                        -> ::std::result::Result<#into_ty_with_generics, #trait_error_ty> {
                         let #from_ty #deconstructed_from = self;
-                        Ok(#into_ty #into_body)
+                        #try_body
                     }
                 }
             )
@@ -482,17 +520,27 @@ fn derive_struct_into(
             )
         }
     } else if is_try {
+        let (trait_error_ty, is_accumulate, custom_accumulator, err_ty) = get_error_and_accumulate_info(Override::as_ref(into).explicit());
+        let try_body = build_try_body(
+            false,
+            original_into_ty,
+            struct_fields,
+            quote!(Self #into_body),
+            is_accumulate,
+            &custom_accumulator,
+            &err_ty,
+        );
         // Implement the [TryFrom] trait
         quote!(
             #[automatically_derived]
             #[allow(non_shorthand_field_patterns)]
             impl #impl_generics TryFrom<#from_ty #from_ty_generics> for #into_ty_with_generics #where_clause {
-                type Error = ::anyhow::Error;
+                type Error = #trait_error_ty;
 
                 fn try_from(from: #from_ty #from_ty_generics)
                     -> ::std::result::Result<Self, <Self as TryFrom<#from_ty #from_ty_generics>>::Error> {
                     let #from_ty #deconstructed_from = from;
-                    Ok(Self #into_body)
+                    #try_body
                 }
             }
         )
@@ -548,6 +596,9 @@ fn derive_enum_from(
     // In patterns we must not use generics
     let from_ty = strip_generics(&from_ty_with_generics);
 
+    // Pre-compute error and accumulate info for use inside the closure
+    let (_, is_acc, custom_acc, acc_err_ty) = get_error_and_accumulate_info(Override::as_ref(from).explicit());
+
     // The other type has
     let match_body = VariantsHelper::new(enum_variants)
         // every non-skipped variant of self
@@ -555,24 +606,32 @@ fn derive_enum_from(
         // every additional variant explicitly set
         .include_extra_variants(derive.add.iter().map(|i| {
             let field = i.field.as_ref();
+            let val: syn::Expr = i.default
+                .as_deref()
+                .expect("'default' must be provided")
+                .clone()
+                // the default expression provided
+                .explicit()
+                .map(|d| d.value)
+                // or Default::default()
+                .unwrap_or_else(|| parse_quote!(Default::default()));
+            let rhs = if is_try {
+                quote!(::std::result::Result::Ok(#val))
+            } else {
+                quote!(#val)
+            };
             (
                 quote!(#from_ty::#field { .. }),
-                // populated with
-                Some(i.default
-                    .as_deref()
-                    .expect("'default' must be provided")
-                    .clone()
-                    // the default expression provided
-                    .explicit()
-                    .map(|d| d.value)
-                    // or Default::default()
-                    .unwrap_or_else(|| parse_quote!(Default::default()))
-                ),
+                Some(rhs),
             )
         }))
         // any other variant ignored, if any
         .ignore_all_extra_variants(if derive.ignore_extra.is_present(){
-            Some(quote!(Default::default()))
+            if is_try {
+                Some(quote!(::std::result::Result::Ok(Default::default())))
+            } else {
+                Some(quote!(Default::default()))
+            }
         } else {
             None
         })
@@ -590,9 +649,9 @@ fn derive_enum_from(
                 .filtering(|_ix, f| f.skip_for(original_from_ty).is_none())
                 // ignoring every additional field explicitly set
                 .extra_fields(v
-                    .additional_for(original_from_ty)
-                    .map(|i| i.iter().map(|i| i.field.as_ref()).collect::<Vec<_>>())
-                    .unwrap_or_default())
+                     .additional_for(original_from_ty)
+                     .map(|i| i.iter().map(|i| i.field.as_ref()).collect::<Vec<_>>())
+                     .unwrap_or_default())
                 // and ignoring any other field, if set
                 .ignore_all_extra(v.ignore_extra_for(original_from_ty))
                 // where we collect each field ident (or the rename) deconstructed
@@ -653,11 +712,20 @@ fn derive_enum_from(
                 // collecting the fields using the `with`
                 .right_collector(|ix, f| {
                     let ident = f.as_ident(ix);
-                    f.build_into_for(true, is_try, &ident, original_from_ty)
+                    if is_try {
+                        quote!(#ident)
+                    } else {
+                        f.build_into_for(true, is_try, &ident, original_from_ty)
+                    }
                 })
                 .collect();
 
-            quote!( #into_ty::#ident #into_fields )
+            let variant_construction = quote!( #into_ty::#ident #into_fields );
+            if is_try {
+                build_try_body(true, original_from_ty, &v.fields, variant_construction, is_acc, &custom_acc, &acc_err_ty)
+            } else {
+                variant_construction
+            }
         })
         .collect();
 
@@ -704,6 +772,7 @@ fn derive_enum_from(
 
         // Implement the custom function
         if is_try {
+            let (trait_error_ty, _, _, _) = get_error_and_accumulate_info(Override::as_ref(from).explicit());
             quote!(
                 #[automatically_derived]
                 #[allow(non_shorthand_field_patterns)]
@@ -711,8 +780,8 @@ fn derive_enum_from(
                     #[doc = #doc]
                     #[allow(clippy::too_many_arguments)]
                     pub fn #fn_name(from: #from_ty_with_generics, #( #external_fields ),*)
-                        -> ::std::result::Result<Self, ::anyhow::Error> {
-                        Ok(match from #match_body)
+                        -> ::std::result::Result<Self, #trait_error_ty> {
+                        match from #match_body
                     }
                 }
             )
@@ -730,17 +799,18 @@ fn derive_enum_from(
             )
         }
     } else if is_try {
+        let (trait_error_ty, _, _, _) = get_error_and_accumulate_info(Override::as_ref(from).explicit());
         // Implement the [TryFrom] trait
         quote!(
             #[automatically_derived]
             #[allow(non_shorthand_field_patterns)]
             impl #impl_generics TryFrom<#from_ty_with_generics> for #into_ty #into_ty_generics #where_clause {
-                type Error = ::anyhow::Error;
+                type Error = #trait_error_ty;
 
                 fn try_from(other: #from_ty_with_generics)
                     -> ::std::result::Result<Self, <Self as TryFrom<#from_ty_with_generics>>::Error> {
 
-                    Ok(match other #match_body)
+                    match other #match_body
                 }
             }
         )
@@ -795,6 +865,9 @@ fn derive_enum_into(
     // In patterns we must not use generics
     let into_ty = strip_generics(&into_ty_with_generics);
 
+    // Pre-compute error and accumulate info for use inside the closure
+    let (_, is_acc, custom_acc, acc_err_ty) = get_error_and_accumulate_info(Override::as_ref(into).explicit());
+
     // Self type has
     let match_body = VariantsHelper::new(enum_variants)
         // every non-skipped variant 
@@ -806,21 +879,25 @@ fn derive_enum_into(
                 .filter_map(|v| v.skip_for(original_into_ty).map(|skip| (v, skip)))
                 .map(|(v, skip)| {
                     let variant = &v.ident;
+                    let val: syn::Expr = skip.as_ref()
+                        .explicit()
+                        .and_then(|s| s.default.as_deref())
+                        // if default enabled: the default expression provided or Default::default()
+                        .map(|d| d
+                            .clone()
+                            .explicit()
+                            .map(|e| e.value)
+                            .unwrap_or_else(|| parse_quote!(Default::default())))
+                        // if default disabled error, as it must be enabled
+                        .expect("'default' is required");
+                    let rhs = if is_try {
+                        quote!(::std::result::Result::Ok(#val))
+                    } else {
+                        quote!(#val)
+                    };
                     (
                         quote!(#from_ty::#variant { .. }),
-                        // populated with
-                        Some(skip.as_ref()
-                            .explicit()
-                            .and_then(|s| s.default.as_deref())
-                            // if default enabled: the default expression provided or Default::default()
-                            .map(|d| d
-                                .clone()
-                                .explicit()
-                                .map(|e| e.value)
-                                .unwrap_or_else(|| parse_quote!(Default::default())))
-                            // if default disabled error, as it must be enabled
-                            .expect("'default' is required")
-                        ),
+                        Some(rhs),
                     )
                 }),
         )
@@ -900,11 +977,20 @@ fn derive_enum_into(
                     } else {
                         f.as_ident(ix)
                     };
-                    f.build_into_for(false, is_try, &ident, original_into_ty)
+                    if is_try {
+                        quote!(#ident)
+                    } else {
+                        f.build_into_for(false, is_try, &ident, original_into_ty)
+                    }
                 })
                 .collect();
 
-            quote!( #into_ty::#ident #into_fields )
+            let variant_construction = quote!( #into_ty::#ident #into_fields );
+            if is_try {
+                build_try_body(false, original_into_ty, &v.fields, variant_construction, is_acc, &custom_acc, &acc_err_ty)
+            } else {
+                variant_construction
+            }
         })
         .collect();
 
@@ -942,6 +1028,7 @@ fn derive_enum_into(
 
         // Implement the custom function
         if is_try {
+            let (trait_error_ty, _, _, _) = get_error_and_accumulate_info(Override::as_ref(into).explicit());
             quote!(
                 #[automatically_derived]
                 #[allow(non_shorthand_field_patterns)]
@@ -949,8 +1036,8 @@ fn derive_enum_into(
                     #[doc = #doc]
                     #[allow(clippy::too_many_arguments)]
                     pub fn #fn_name(self, #( #external_fields ),*)
-                        -> ::std::result::Result<#into_ty_with_generics, ::anyhow::Error> {
-                        Ok(match self #match_body)
+                        -> ::std::result::Result<#into_ty_with_generics, #trait_error_ty> {
+                        match self #match_body
                     }
                 }
             )
@@ -961,24 +1048,25 @@ fn derive_enum_into(
                 impl #impl_generics #from_ty #from_ty_generics #where_clause {
                     #[doc = #doc]
                     #[allow(clippy::too_many_arguments)]
-                    fn #fn_name(self, #( #external_fields ),*) -> #into_ty_with_generics {
+                    pub fn #fn_name(self, #( #external_fields ),*) -> #into_ty_with_generics {
                         match self #match_body
                     }
                 }
             )
         }
     } else if is_try {
+        let (trait_error_ty, _, _, _) = get_error_and_accumulate_info(Override::as_ref(into).explicit());
         // Implement the [TryFrom] trait
         quote!(
             #[automatically_derived]
             #[allow(non_shorthand_field_patterns)]
             impl #impl_generics TryFrom<#from_ty #from_ty_generics> for #into_ty_with_generics #where_clause {
-                type Error = ::anyhow::Error;
+                type Error = #trait_error_ty;
 
                 fn try_from(other: #from_ty #from_ty_generics)
                     -> ::std::result::Result<Self, <Self as TryFrom<#from_ty #from_ty_generics>>::Error> {
 
-                    Ok(match other #match_body)
+                    match other #match_body
                 }
             }
         )
@@ -1072,4 +1160,135 @@ fn strip_generics(ty: &syn::TypePath) -> syn::TypePath {
         segment.arguments = syn::PathArguments::None;
     }
     new_ty
+}
+
+fn get_error_and_accumulate_info(
+    derive_input: Option<&DeriveInput>,
+) -> (syn::Type, bool, Option<syn::Type>, syn::Type) {
+    let err_ty: syn::Type = derive_input
+        .and_then(|i| i.err.clone())
+        .map(|w| syn::Type::Path(w.0))
+        .unwrap_or_else(|| parse_quote!(::anyhow::Error));
+
+    let mut is_accumulate = false;
+    let mut custom_accumulator = None;
+
+    if let Some(input) = derive_input {
+        if let Some(acc) = &input.accumulate {
+            is_accumulate = true;
+            match acc.as_ref() {
+                Override::Explicit(ty) => {
+                    custom_accumulator = Some(syn::Type::Path(ty.0.clone()));
+                }
+                Override::Inherit => {}
+            }
+        }
+    }
+
+    let trait_error_ty = if is_accumulate {
+        if let Some(custom) = &custom_accumulator {
+            custom.clone()
+        } else {
+            parse_quote!(::std::vec::Vec<#err_ty>)
+        }
+    } else {
+        err_ty.clone()
+    };
+
+    (trait_error_ty, is_accumulate, custom_accumulator, err_ty)
+}
+
+fn build_try_body(
+    from: bool,
+    original_path: &syn::TypePath,
+    fields: &Fields<FieldReceiver>,
+    construction_expr: TokenStream,
+    is_accumulate: bool,
+    custom_accumulator: &Option<syn::Type>,
+    err_ty: &syn::Type,
+) -> TokenStream {
+    if is_accumulate {
+        let mut field_conversions = TokenStream::new();
+        let mut field_unwraps = TokenStream::new();
+
+        for (ix, f) in fields.iter().enumerate() {
+            if f.skip_for(original_path).is_none() {
+                let ident = if from {
+                    f.as_ident(ix)
+                } else if let Some(rename) = f.rename_for(original_path) {
+                    rename.clone()
+                } else {
+                    f.as_ident(ix)
+                };
+                let raw_expr = f.build_into_for(from, true, &ident, original_path);
+                let map_err = if let Some(err_expr) = f.err_for(original_path) {
+                    quote!(|_| #err_expr)
+                } else if let Some(err_with_expr) = f.err_with_for(original_path) {
+                    quote!(#err_with_expr)
+                } else {
+                    quote!(<#err_ty as ::std::convert::From<_>>::from)
+                };
+
+                field_conversions.extend(quote!(
+                    let #ident = match #raw_expr {
+                        ::std::result::Result::Ok(val) => ::std::option::Option::Some(val),
+                        ::std::result::Result::Err(err) => {
+                            let mapped_err = (#map_err)(err);
+                            errors.push(mapped_err);
+                            ::std::option::Option::None
+                        }
+                    };
+                ));
+
+                field_unwraps.extend(quote!(
+                    let #ident = #ident.expect("field conversion succeeded but value missing");
+                ));
+            }
+        }
+
+        let err_return = if let Some(custom) = custom_accumulator {
+            quote!(::std::result::Result::Err(errors.into_iter().collect::<#custom>()))
+        } else {
+            quote!(::std::result::Result::Err(errors))
+        };
+
+        quote!({
+            let mut errors = ::std::vec::Vec::new();
+            #field_conversions
+            if errors.is_empty() {
+                #field_unwraps
+                ::std::result::Result::Ok(#construction_expr)
+            } else {
+                #err_return
+            }
+        })
+    } else {
+        let mut field_conversions = TokenStream::new();
+        for (ix, f) in fields.iter().enumerate() {
+            if f.skip_for(original_path).is_none() {
+                let ident = if from {
+                    f.as_ident(ix)
+                } else if let Some(rename) = f.rename_for(original_path) {
+                    rename.clone()
+                } else {
+                    f.as_ident(ix)
+                };
+                let raw_expr = f.build_into_for(from, true, &ident, original_path);
+                let stmt = if let Some(err_expr) = f.err_for(original_path) {
+                    quote!(let #ident = #raw_expr.map_err(|_| #err_expr)?;)
+                } else if let Some(err_with_expr) = f.err_with_for(original_path) {
+                    quote!(let #ident = #raw_expr.map_err(#err_with_expr)?;)
+                } else {
+                    quote!(let #ident = #raw_expr ?;)
+                };
+
+                field_conversions.extend(stmt);
+            }
+        }
+
+        quote!({
+            #field_conversions
+            ::std::result::Result::Ok(#construction_expr)
+        })
+    }
 }

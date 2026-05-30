@@ -24,9 +24,15 @@ use proc_macro_error2::proc_macro_error;
 /// - `try_from` _(optional)_: Whether to derive `TryFrom` the other type for self
 ///   - `custom` _(optional)_: Derive a custom function instead of the trait
 ///   - `custom = from_other` _(optional)_: Derive a custom function instead of the trait, with the given name
+///   - `err = TargetError` _(optional)_: Explicit target error type for fallible conversions.
+///   - `accumulate` _(optional)_: Collect errors into `Vec<TargetError>` instead of short-circuiting on the first failure.
+///   - `accumulate = CustomAccumulator` _(optional)_: Collect errors into `CustomAccumulator` instead of `Vec`.
 /// - `try_into` _(optional)_: Whether to derive `TryFrom` self for the other type
 ///   - `custom` _(optional)_: Derive a custom function instead of the trait
 ///   - `custom = from_other` _(optional)_: Derive a custom function instead of the trait, with the given name
+///   - `err = TargetError` _(optional)_: Explicit target error type for fallible conversions.
+///   - `accumulate` _(optional)_: Collect errors into `Vec<TargetError>` instead of short-circuiting on the first failure.
+///   - `accumulate = CustomAccumulator` _(optional)_: Collect errors into `CustomAccumulator` instead of `Vec`.
 /// - `add` _(optional, multiple)_: Additional fields (for structs with named fields) or variants (for enums) the other
 ///   type has and this one doesn't **&#xb9;**
 ///   - `field = other_field` _(mandatory)_: The field or variant name
@@ -62,6 +68,10 @@ use proc_macro_error2::proc_macro_error;
 ///   - `default` _(optional)_: The field or variant will be populated using `Default::default()`
 ///     - `value = get_default_value()` _(optional)_: The field or variant will be populated with the given expression
 ///       instead
+/// - `err = ErrorVal` _(optional)_: Map conversion failures for this field to the specific error value `ErrorVal`. Used for error erasure
+///   where the original error is discarded (e.g. mapping to a unit variant error like `AppError::InvalidStatus`).
+/// - `err_with = MapFn` _(optional)_: Map conversion failures for this field using the helper function/callable `MapFn` (which can
+///   be a tuple variant constructor, a closure, or a function/method path). This preserves or maps the source error.
 ///
 /// Additional hints on how to map fields:
 ///
@@ -74,7 +84,7 @@ use proc_macro_error2::proc_macro_error;
 /// - `with = mod::my_function` _(optional)_: If the field type doesn't implement `Into` or `TryInto` the other, this
 ///   property allows you to customize the behavior by providing a conversion function
 /// - `from_with = mod::my_function` _(optional)_: The same as above but only for the `from` or `try_from` derives
-/// - `from_with = mod::my_function` _(optional)_: The same as above but only for the `from` or `try_from` derives
+/// - `into_with = mod::my_function` _(optional)_: The same as above but only for the `into` or `try_into` derives
 ///
 /// **&#xb9;** When providing additional fields without defaults, the `From` and `TryFrom` traits can't be derived and
 /// a custom function will be required instead. When deriving `into` or `try_into`, the `ty` must be provided as well.

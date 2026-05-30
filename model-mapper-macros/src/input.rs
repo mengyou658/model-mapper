@@ -152,6 +152,12 @@ pub(super) struct FieldReceiver {
     /// Mapper hints
     #[darling(flatten)]
     hint: MapperHint,
+    /// Error expression to map conversion failures (error erasure), only valid for `try_from` / `try_into`
+    #[darling(default)]
+    err: Option<SpannedValue<syn::Expr>>,
+    /// Error mapping expression to preserve/map the source error, only valid for `try_from` / `try_into`
+    #[darling(default)]
+    err_with: Option<SpannedValue<syn::Expr>>,
 }
 macro_field_utils::field_info!(FieldReceiver);
 
@@ -172,6 +178,12 @@ struct ItemFieldInput {
     /// Mapper hints
     #[darling(flatten)]
     hint: MapperHint,
+    /// Error expression to map conversion failures (error erasure), only valid for `try_from` / `try_into`
+    #[darling(default)]
+    err: Option<SpannedValue<syn::Expr>>,
+    /// Error mapping expression to preserve/map the source error, only valid for `try_from` / `try_into`
+    #[darling(default)]
+    err_with: Option<SpannedValue<syn::Expr>>,
 }
 
 #[derive(Debug, FromMeta, Clone)]
@@ -210,6 +222,12 @@ pub(super) struct DeriveInput {
     /// Whether the derive has external properties or not (name of the custom function if populated)
     #[darling(default)]
     pub(super) custom: Option<SpannedValue<Override<syn::Ident>>>,
+    /// Explicit target error type for fallible conversions
+    #[darling(default)]
+    pub(super) err: Option<TypePathWrapper>,
+    /// Whether to accumulate errors instead of short-circuiting, optionally with a custom accumulator type
+    #[darling(default)]
+    pub(super) accumulate: Option<SpannedValue<Override<TypePathWrapper>>>,
 }
 
 #[derive(Debug, FromMeta, Clone)]
@@ -587,6 +605,27 @@ impl ItemFieldInput {
                     );
                 }
             }
+            // validate only one of err or err_with
+            if self.err.is_some() && self.err_with.is_some() {
+                emit_error!(span, "Only one of 'err' or 'err_with' can be set");
+            }
+            // validate err is not a closure
+            if let Some(err) = &self.err
+                && let syn::Expr::Closure(_) = err.as_ref()
+            {
+                emit_error!(
+                    err.span(),
+                    "Use 'err_with' instead of 'err' for closure-based error mapping"
+                );
+            }
+            // validate err/err_with only used with try_from or try_into
+            if (self.err.is_some() || self.err_with.is_some()) && derive.try_from.is_none() && derive.try_into.is_none()
+            {
+                emit_error!(
+                    span,
+                    "'err' and 'err_with' are only valid when 'try_from' or 'try_into' is set"
+                );
+            }
             // validate only one hint
             let mut hint_count = 0;
             if self.hint.with.is_some() {
@@ -665,6 +704,12 @@ impl FieldReceiver {
             if let Some(unbox) = self.hint.unbox.as_ref() {
                 emit_error!(unbox.span(), "Illegal attribute if 'when' is set")
             }
+            if let Some(err) = self.err.as_ref() {
+                emit_error!(err.span(), "Illegal attribute if 'when' is set")
+            }
+            if let Some(err_with) = self.err_with.as_ref() {
+                emit_error!(err_with.span(), "Illegal attribute if 'when' is set")
+            }
             // Verify there same type is not duplicated
             let paths = self.items.iter().map(|i| &i.path).collect::<Vec<_>>();
             for i in 0..paths.len() {
@@ -683,6 +728,8 @@ impl FieldReceiver {
                 skip: self.skip.clone(),
                 other_ty: self.other_ty.clone(),
                 hint: self.hint.clone(),
+                err: self.err.clone(),
+                err_with: self.err_with.clone(),
             }
             .validate(span, derives);
         } else {
@@ -693,6 +740,8 @@ impl FieldReceiver {
                     skip: self.skip.clone(),
                     other_ty: self.other_ty.clone(),
                     hint: self.hint.clone(),
+                    err: self.err.clone(),
+                    err_with: self.err_with.clone(),
                 }
                 .validate(span, derives);
             }
@@ -718,6 +767,41 @@ impl FieldReceiver {
             self.rename.as_deref()
         }
     }
+
+    pub(super) fn err_for(&self, derive_path: &syn::TypePath) -> Option<&syn::Expr> {
+        for item in &self.items {
+            if item.path.as_ref() == derive_path {
+                return item.err.as_deref();
+            }
+        }
+        if let Some(path) = &self.path {
+            if path.as_ref() == derive_path {
+                self.err.as_deref()
+            } else {
+                None
+            }
+        } else {
+            self.err.as_deref()
+        }
+    }
+
+    pub(super) fn err_with_for(&self, derive_path: &syn::TypePath) -> Option<&syn::Expr> {
+        for item in &self.items {
+            if item.path.as_ref() == derive_path {
+                return item.err_with.as_deref();
+            }
+        }
+        if let Some(path) = &self.path {
+            if path.as_ref() == derive_path {
+                self.err_with.as_deref()
+            } else {
+                None
+            }
+        } else {
+            self.err_with.as_deref()
+        }
+    }
+
 
     pub(super) fn skip_for(&self, derive_path: &syn::TypePath) -> Option<&Override<SkipInput>> {
         for item in &self.items {
@@ -777,8 +861,7 @@ impl FieldReceiver {
         ident: &syn::Ident,
         derive_path: &syn::TypePath,
     ) -> TokenStream {
-        let into = build_into_for_inner(from, is_try, ident, self.hint_for(derive_path));
-        if is_try { quote!(#into?) } else { into }
+        build_into_for_inner(from, is_try, ident, self.hint_for(derive_path))
     }
 }
 
