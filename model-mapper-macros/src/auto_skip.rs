@@ -2,7 +2,7 @@
 //! names. Used by the `auto_skip` feature to detect fields that exist on the
 //! other type but not on self (or vice versa).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use proc_macro2::Span;
@@ -17,6 +17,17 @@ use syn::{Fields, Ident, Item, ItemUse, TypePath, UseTree};
 /// caller should fall back to default behavior (compile-time error) or
 /// warn the user.
 pub(super) fn discover_other_type_fields(ty: &TypePath) -> Option<HashSet<Ident>> {
+    discover_other_type_field_info(ty).map(|info| info.into_keys().collect())
+}
+
+/// Attempt to discover the named fields of the struct/enum referenced by `ty`
+/// along with their declared types, by reading the source file where the type
+/// was referenced and following any `use` imports as needed.
+///
+/// The returned `Type` is the exact `syn::Type` declared on the field, so
+/// callers can inspect the type to apply special conversion rules
+/// (e.g. `HasOne<…>` / `HasMany<…>` from sea-orm).
+pub(super) fn discover_other_type_field_info(ty: &TypePath) -> Option<HashMap<Ident, syn::Type>> {
     // Step 1: get the file where `ty` is referenced.
     let origin_file = source_file_of_span(&ty.span())?;
 
@@ -29,8 +40,14 @@ pub(super) fn discover_other_type_fields(ty: &TypePath) -> Option<HashSet<Ident>
     // Step 4: first, look for the type in the current file (handles inline
     // modules and the trivial case where the type lives next to the
     // `#[mapper]` call).
-    if let Some(fields) = find_named_fields_in_file(&origin, &origin_file, "", &type_name, &mut Vec::new()) {
-        return Some(fields);
+    if let Some(info) = find_named_fields_with_types_in_file(
+        &origin,
+        &origin_file,
+        "",
+        &type_name,
+        &mut Vec::new(),
+    ) {
+        return Some(info);
     }
 
     // Step 5: walk every `use` statement and try to resolve it to a file that
@@ -44,14 +61,49 @@ pub(super) fn discover_other_type_fields(ty: &TypePath) -> Option<HashSet<Ident>
         if let Item::Use(use_stmt) = item {
             for resolved_file in collect_resolved_files(use_stmt, &origin_file) {
                 if let Some(content) = read_and_parse(&resolved_file) {
-                    if let Some(fields) = find_named_fields_in_file(
+                    if let Some(info) = find_named_fields_with_types_in_file(
                         &content,
                         &resolved_file,
                         "",
                         &type_name,
                         &mut Vec::new(),
                     ) {
-                        return Some(fields);
+                        return Some(info);
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 6 (sea-orm 2.0 fallback): if the type ends with `Ex` (e.g.
+    // `ModelEx`) we couldn't find it because `#[sea_orm::model]` generates
+    // it from the companion `Model` struct. The generated `ModelEx` mirrors
+    // `Model` field-for-field, so we can fall back to `Model`'s definition.
+    if let Some(stripped) = type_name.to_string().strip_suffix("Ex") {
+        if let Ok(alt_ident) = syn::parse_str::<Ident>(stripped) {
+            if let Some(info) = find_named_fields_with_types_in_file(
+                &origin,
+                &origin_file,
+                "",
+                &alt_ident,
+                &mut Vec::new(),
+            ) {
+                return Some(info);
+            }
+            for item in &origin.items {
+                if let Item::Use(use_stmt) = item {
+                    for resolved_file in collect_resolved_files(use_stmt, &origin_file) {
+                        if let Some(content) = read_and_parse(&resolved_file) {
+                            if let Some(info) = find_named_fields_with_types_in_file(
+                                &content,
+                                &resolved_file,
+                                "",
+                                &alt_ident,
+                                &mut Vec::new(),
+                            ) {
+                                return Some(info);
+                            }
+                        }
                     }
                 }
             }
@@ -284,6 +336,131 @@ fn extract_named_fields(fields: &Fields) -> HashSet<Ident> {
         }
     }
     set
+}
+
+/// Same as [`find_named_fields_in_file`] but also returns the declared `syn::Type`
+/// of every field, so callers can apply type-driven conversion rules (e.g.
+/// sea-orm `HasOne<…>` / `HasMany<…>`).
+fn find_named_fields_with_types_in_file(
+    file: &syn::File,
+    file_path: &Path,
+    mod_path: &str,
+    type_name: &Ident,
+    visited: &mut Vec<String>,
+) -> Option<HashMap<Ident, syn::Type>> {
+    // The visited key includes the type_name so that we can recurse into the
+    // same file looking for a *different* type (e.g. when following a type
+    // alias like `pub type MemberUser = Model;`). Without the type_name in
+    // the key, the recursion would be cut short.
+    let key = format!("{}::{}::{}", file_path.display(), mod_path, type_name);
+    if visited.contains(&key) {
+        return None;
+    }
+    visited.push(key);
+
+    // First pass: look for a struct/enum/type-alias with the matching name in this file.
+    for item in &file.items {
+        match item {
+            Item::Struct(s) if s.ident == *type_name => {
+                return Some(extract_named_fields_with_types(&s.fields));
+            }
+            Item::Enum(e) if e.ident == *type_name => {
+                // Enums don't have typed fields; mimic `extract_named_fields`
+                // but use the variant ident as both key and a unit type.
+                let mut map = HashMap::new();
+                for v in &e.variants {
+                    map.insert(
+                        v.ident.clone(),
+                        syn::Type::Tuple(syn::TypeTuple {
+                            paren_token: syn::token::Paren::default(),
+                            elems: syn::punctuated::Punctuated::new(),
+                        }),
+                    );
+                }
+                return Some(map);
+            }
+            Item::Type(t) if t.ident == *type_name => {
+                // Type alias: follow it to the underlying type.
+                if let syn::Type::Path(target_path) = &*t.ty {
+                    if let Some(last_seg) = target_path.path.segments.last() {
+                        let target_ident = last_seg.ident.clone();
+                        if target_ident != *type_name {
+                            if let Some(fields) = find_named_fields_with_types_in_file(
+                                file,
+                                file_path,
+                                mod_path,
+                                &target_ident,
+                                visited,
+                            ) {
+                                return Some(fields);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Second pass: walk `mod` items to find inline modules.
+    for item in &file.items {
+        if let Item::Mod(m) = item {
+            if let Some((_, items)) = &m.content {
+                let nested = syn::File {
+                    shebang: None,
+                    attrs: vec![],
+                    items: items.clone(),
+                };
+                let nested_path = if mod_path.is_empty() {
+                    m.ident.to_string()
+                } else {
+                    format!("{}::{}", mod_path, m.ident)
+                };
+                if let Some(fields) = find_named_fields_with_types_in_file(
+                    &nested,
+                    file_path,
+                    &nested_path,
+                    type_name,
+                    visited,
+                ) {
+                    return Some(fields);
+                }
+            }
+        }
+    }
+
+    // Third pass: walk `use` statements that re-export `type_name`.
+    for item in &file.items {
+        if let Item::Use(use_stmt) = item {
+            if let Some(resolved) = resolve_use_for_type(use_stmt, type_name, file_path) {
+                if let Some(content) = read_and_parse(&resolved) {
+                    if let Some(fields) = find_named_fields_with_types_in_file(
+                        &content,
+                        &resolved,
+                        "",
+                        type_name,
+                        visited,
+                    ) {
+                        return Some(fields);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_named_fields_with_types(fields: &Fields) -> HashMap<Ident, syn::Type> {
+    let mut map = HashMap::new();
+    if let Fields::Named(named) = fields {
+        for f in &named.named {
+            if let Some(ident) = &f.ident {
+                map.insert(ident.clone(), f.ty.clone());
+            }
+        }
+    }
+    map
 }
 
 /// If `use_stmt` re-exports `type_name` (possibly as one of many in a group),

@@ -134,6 +134,14 @@ struct AutoSkipFields {
     /// Other type fields that don't exist on self. They must be ignored on the
     /// from side and provided with `Default::default()` on the into side.
     other_extra: HashSet<syn::Ident>,
+    /// Field idents on the *other* type whose declared type is a sea-orm
+    /// relation marker (`HasOne<…>` / `HasMany<…>`). These don't carry
+    /// data, so when converting from them we emit `Default::default()`
+    /// for the destination field. We track them separately from
+    /// `self_extra`/`other_extra` so we can keep the field in the source
+    /// deconstruction pattern (it's a real field on the source) but
+    /// substitute the destination value with a `Default::default()`.
+    other_relation_fields: HashSet<syn::Ident>,
 }
 
 /// If `auto_skip` is set on the derive, resolve the field set of the other
@@ -148,10 +156,11 @@ fn auto_skip_idents(
         return AutoSkipFields {
             self_extra: HashSet::new(),
             other_extra: HashSet::new(),
+            other_relation_fields: HashSet::new(),
         };
     }
 
-    let Some(other_fields) = auto_skip::discover_other_type_fields(other_ty) else {
+    let Some(other_field_info) = auto_skip::discover_other_type_field_info(other_ty) else {
         // Surface a clear error: we promised auto-skip, but couldn't resolve
         // the other type's source.
         emit_error!(
@@ -164,6 +173,7 @@ fn auto_skip_idents(
         return AutoSkipFields {
             self_extra: HashSet::new(),
             other_extra: HashSet::new(),
+            other_relation_fields: HashSet::new(),
         };
     };
 
@@ -176,21 +186,53 @@ fn auto_skip_idents(
 
     let self_extra = self_idents
         .iter()
-        .filter(|ident| !other_fields.contains(*ident))
+        .filter(|ident| !other_field_info.contains_key(*ident))
         .cloned()
         .cloned()
         .collect();
 
-    let other_extra = other_fields
-        .iter()
+    let other_extra = other_field_info
+        .keys()
         .filter(|ident| !self_idents.contains(*ident))
         .cloned()
+        .collect();
+
+    // Identify sea-orm relation fields on the other type. These are present
+    // on the source struct (so they should remain in the deconstruction
+    // pattern), but they don't carry any data, so the destination field
+    // must be filled with `Default::default()`.
+    let other_relation_fields = other_field_info
+        .iter()
+        .filter_map(|(ident, ty)| {
+            if is_sea_orm_relation_type(ty) {
+                Some(ident.clone())
+            } else {
+                None
+            }
+        })
         .collect();
 
     AutoSkipFields {
         self_extra,
         other_extra,
+        other_relation_fields,
     }
+}
+
+/// Returns `true` when the given type is a sea-orm relation marker
+/// (`HasOne<…>` / `HasMany<…>`, possibly with generic arguments). The
+/// `#[sea_orm::model]` / `#[derive(DeriveEntityModel)]` macros strip these
+/// fields from the generated struct at compile time, so they cannot be
+/// destructured in the generated `From` impl.
+fn is_sea_orm_relation_type(ty: &syn::Type) -> bool {
+    const RELATION_TYPE_NAMES: &[&str] = &["HasOne", "HasMany"];
+
+    if let syn::Type::Path(type_path) = ty {
+        if let Some(last_seg) = type_path.path.segments.last() {
+            return RELATION_TYPE_NAMES.contains(&last_seg.ident.to_string().as_str());
+        }
+    }
+    false
 }
 
 fn derive_struct_from(
@@ -326,6 +368,18 @@ fn derive_struct_from(
     let into_body = into_ty_fields_helper
         .right_collector(|ix, f| {
             let ident = f.as_ident(ix);
+            // Sea-orm relation fields on the source (HasOne<…>/HasMany<…>) are
+            // zero-sized marker types that don't carry any data. We can't
+            // `Into::into()` them into the destination type, so we emit
+            // `Default::default()` for the destination field. This is the
+            // type-based adaptation requested by users migrating from
+            // stripped `Model` to extended `ModelEx` structures.
+            if !is_try
+                && let Some(field_ident) = f.ident.as_ref()
+                && auto_skip.other_relation_fields.contains(field_ident)
+            {
+                return quote!(Default::default());
+            }
             if is_try {
                 quote!(#ident)
             } else {
