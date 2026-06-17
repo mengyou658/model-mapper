@@ -125,17 +125,30 @@ fn derive_enum(
     output
 }
 
+/// The set of fields that need to be mass-produced with `Default::default()`
+/// when generating the conversion, split by the side they belong to.
+struct AutoSkipFields {
+    /// Self fields that don't exist on the other type. They must be skipped on
+    /// the from side and provided with `Default::default()` on the into side.
+    self_extra: HashSet<syn::Ident>,
+    /// Other type fields that don't exist on self. They must be ignored on the
+    /// from side and provided with `Default::default()` on the into side.
+    other_extra: HashSet<syn::Ident>,
+}
+
 /// If `auto_skip` is set on the derive, resolve the field set of the other
-/// type from its source file and return the set of self field idents that do
-/// NOT exist on the other type. When `auto_skip` is not set, returns an empty
-/// set.
+/// type from its source file and split the field sets into self-only and
+/// other-only idents. When `auto_skip` is not set, returns empty sets.
 fn auto_skip_idents(
     derive: &ItemInput,
     struct_fields: &Fields<FieldReceiver>,
     other_ty: &syn::TypePath,
-) -> HashSet<syn::Ident> {
+) -> AutoSkipFields {
     if !derive.auto_skip.is_present() {
-        return HashSet::new();
+        return AutoSkipFields {
+            self_extra: HashSet::new(),
+            other_extra: HashSet::new(),
+        };
     }
 
     let Some(other_fields) = auto_skip::discover_other_type_fields(other_ty) else {
@@ -148,20 +161,36 @@ fn auto_skip_idents(
              reachable via a `use` statement, or remove `auto_skip`.",
             other_ty.to_token_stream()
         );
-        return HashSet::new();
+        return AutoSkipFields {
+            self_extra: HashSet::new(),
+            other_extra: HashSet::new(),
+        };
     };
 
-    struct_fields
+    // Collect the set of self field idents for fast lookup of the other_extra
+    // set.
+    let self_idents: HashSet<&syn::Ident> = struct_fields
         .iter()
-        .filter_map(|f| {
-            let ident = f.ident.as_ref()?;
-            if !other_fields.contains(ident) {
-                Some(ident.clone())
-            } else {
-                None
-            }
-        })
-        .collect()
+        .filter_map(|f| f.ident.as_ref())
+        .collect();
+
+    let self_extra = self_idents
+        .iter()
+        .filter(|ident| !other_fields.contains(*ident))
+        .cloned()
+        .cloned()
+        .collect();
+
+    let other_extra = other_fields
+        .iter()
+        .filter(|ident| !self_idents.contains(*ident))
+        .cloned()
+        .collect();
+
+    AutoSkipFields {
+        self_extra,
+        other_extra,
+    }
 }
 
 fn derive_struct_from(
@@ -201,7 +230,9 @@ fn derive_struct_from(
 
     // Compute the set of self fields that don't exist on the other type
     // (only when `auto_skip` is enabled).
-    let extra_skip = auto_skip_idents(derive, struct_fields, original_from_ty);
+    let auto_skip = auto_skip_idents(derive, struct_fields, original_from_ty);
+    let self_extra = &auto_skip.self_extra;
+    let other_extra = &auto_skip.other_extra;
 
     // The other type has
     let from_ty_fields_helper = FieldsHelper::new(struct_fields)
@@ -213,13 +244,15 @@ fn derive_struct_from(
                 // discovery is name-based, so we leave them alone.
                 && f.ident
                     .as_ref()
-                    .map(|i| !extra_skip.contains(i))
+                    .map(|i| !self_extra.contains(i))
                     .unwrap_or(true)
         })
         // every additional field explicitly set
         .extra_fields(derive.add.iter().map(|f| f.field.as_ref()))
-        // any other field ignored, if set
-        .ignore_all_extra(derive.ignore_extra.is_present() || !extra_skip.is_empty());
+        // any other field ignored, if set. The auto-skip case is also
+        // covered: if any field exists only on the other side, the from
+        // pattern needs `..` to swallow it.
+        .ignore_all_extra(derive.ignore_extra.is_present() || !self_extra.is_empty() || !other_extra.is_empty());
 
     // Self type has
     let into_ty_fields_helper = FieldsHelper::new(struct_fields)
@@ -228,7 +261,7 @@ fn derive_struct_from(
             f.skip_for(original_from_ty).is_none()
                 && f.ident
                     .as_ref()
-                    .map(|i| !extra_skip.contains(i))
+                    .map(|i| !self_extra.contains(i))
                     .unwrap_or(true)
         })
         // skipped fields with the custom value provided
@@ -264,8 +297,17 @@ fn derive_struct_from(
                     })
                 }),
         )
-        // add fields that don't exist on the other type back as `field: Default::default()`
-        .extra_default_fields(extra_skip.iter());
+        // add fields that don't exist on the other type back as
+        // `field: Default::default()`. Skip fields that are already handled
+        // by the `extra_fields_with` block above to avoid emitting the same
+        // field twice in the constructed struct.
+        .extra_default_fields(self_extra.iter().filter(|ident| {
+            struct_fields
+                .iter()
+                .find(|f| f.ident.as_ref() == Some(*ident))
+                .and_then(|f| f.skip_for(original_from_ty))
+                .is_none()
+        }));
 
     // Deconstruct the `from` input to retrieve the inner fields
     let deconstructed_from = from_ty_fields_helper
@@ -447,10 +489,25 @@ fn derive_struct_into(
 
     // Compute the set of self fields that don't exist on the other type
     // (only when `auto_skip` is enabled).
-    let extra_skip = auto_skip_idents(derive, struct_fields, original_into_ty);
+    let auto_skip = auto_skip_idents(derive, struct_fields, original_into_ty);
+    let self_extra = &auto_skip.self_extra;
+    let other_extra = &auto_skip.other_extra;
 
     // Self type has every field (whether it's used or not)
-    let from_ty_fields_helper = FieldsHelper::new(struct_fields);
+    let from_ty_fields_helper = FieldsHelper::new(struct_fields)
+        // drop self fields that don't exist on the other type, since we
+        // wouldn't know how to fill them in on the into side. They are
+        // handled by the `..` below when `include_all_default` is enabled.
+        .filtering(|_ix, f| {
+            f.ident
+                .as_ref()
+                .map(|i| !self_extra.contains(i))
+                .unwrap_or(true)
+        })
+        // The deconstruction of self may have leftover fields (those that
+        // exist on self but not on the other type). Append `..` to swallow
+        // them, since we don't need them on the into side.
+        .ignore_all_extra(!self_extra.is_empty());
 
     // The other type has
     let into_ty_fields_helper = FieldsHelper::new(struct_fields)
@@ -459,7 +516,7 @@ fn derive_struct_into(
             f.skip_for(original_into_ty).is_none()
                 && f.ident
                     .as_ref()
-                    .map(|i| !extra_skip.contains(i))
+                    .map(|i| !self_extra.contains(i))
                     .unwrap_or(true)
         })
         // every additional field explicitly set
@@ -481,8 +538,16 @@ fn derive_struct_into(
                     .unwrap_or_else(|| parse_quote!(#field)),
             )
         }))
-        // any other ignored field, with the default value
-        .include_all_default(derive.ignore_extra.is_present() || !extra_skip.is_empty());
+        // Other type fields that don't exist on self must be populated with
+        // `Default::default()`. We add them explicitly here so the generated
+        // code doesn't require the other type to implement `Default`.
+        .extra_default_fields(other_extra.iter())
+        // any other ignored field, with the default value. This handles the
+        // case where the other type has even more fields we couldn't discover
+        // (e.g. an external type without an accessible source file): fall
+        // back to `..Default::default()` which requires the other type to
+        // implement `Default`.
+        .include_all_default(derive.ignore_extra.is_present() || !self_extra.is_empty());
 
     // Deconstruct the `from` input to retrieve the inner fields
     let deconstructed_from = from_ty_fields_helper

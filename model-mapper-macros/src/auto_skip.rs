@@ -26,8 +26,116 @@ pub(super) fn discover_other_type_fields(ty: &TypePath) -> Option<HashSet<Ident>
     // Step 3: get the type name.
     let type_name = ty.path.segments.last()?.ident.clone();
 
-    // Step 4: try to find the struct/enum in this file, possibly following `use`.
-    find_named_fields_in_file(&origin, &origin_file, "", &type_name, &mut Vec::new())
+    // Step 4: first, look for the type in the current file (handles inline
+    // modules and the trivial case where the type lives next to the
+    // `#[mapper]` call).
+    if let Some(fields) = find_named_fields_in_file(&origin, &origin_file, "", &type_name, &mut Vec::new()) {
+        return Some(fields);
+    }
+
+    // Step 5: walk every `use` statement and try to resolve it to a file that
+    // might contain the type. The original implementation only matched use
+    // statements that explicitly imported the type name (e.g.
+    // `use foo::Bar;`). That breaks for the very common pattern
+    // `use crate::entity::foo;` followed by a reference to
+    // `crate::entity::foo::Bar` – the use only imports the *module*, not the
+    // type, so the macro can't find the source file.
+    for item in &origin.items {
+        if let Item::Use(use_stmt) = item {
+            for resolved_file in collect_resolved_files(use_stmt, &origin_file) {
+                if let Some(content) = read_and_parse(&resolved_file) {
+                    if let Some(fields) = find_named_fields_in_file(
+                        &content,
+                        &resolved_file,
+                        "",
+                        &type_name,
+                        &mut Vec::new(),
+                    ) {
+                        return Some(fields);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Walk a `use` tree and resolve every leaf to a file path. For grouped uses
+/// such as `use foo::{a, b};` this returns one file per leaf. Globs are
+/// ignored (we can't know what's in them without parsing the target file).
+fn collect_resolved_files(use_stmt: &ItemUse, current_file: &Path) -> Vec<PathBuf> {
+    let mut results = Vec::new();
+    collect_from_tree(&use_stmt.tree, &[], current_file, &mut results);
+    results
+}
+
+fn collect_from_tree(
+    tree: &UseTree,
+    prefix: &[String],
+    current_file: &Path,
+    results: &mut Vec<PathBuf>,
+) {
+    match tree {
+        UseTree::Path(p) => {
+            let mut new_prefix = prefix.to_vec();
+            new_prefix.push(p.ident.to_string());
+            collect_from_tree(&p.tree, &new_prefix, current_file, results);
+        }
+        UseTree::Name(n) => {
+            // The leaf is a type/value being imported. Try two strategies:
+            //
+            // 1. Resolve the full path as a module (e.g. `use crate::foo::bar;`
+            //    re-exports a sub-module). This is mostly relevant for glob
+            //    re-exports like `pub use self::foo::*;` (handled elsewhere)
+            //    and grouped uses with explicit module paths.
+            // 2. Resolve the *prefix* (everything before the leaf) as a module
+            //    file, then look for the type inside that file. This handles
+            //    the common pattern `use crate::entity::foo::Model;` where
+            //    `Model` is a type/struct/enum/type-alias inside `foo.rs`,
+            //    not a module of its own.
+            let mut full_path = prefix.to_vec();
+            full_path.push(n.ident.to_string());
+            if let Some(file) = resolve_path_to_file(&full_path, current_file) {
+                if file.is_file() {
+                    results.push(file);
+                }
+            }
+            if !prefix.is_empty() {
+                if let Some(file) = resolve_path_to_file(prefix, current_file) {
+                    if file.is_file() {
+                        results.push(file);
+                    }
+                }
+            }
+        }
+        UseTree::Rename(r) => {
+            // `use foo::Bar as Baz;` — `Baz` is the local alias, `Bar` is the
+            // original name. We resolve by the original name.
+            let mut full_path = prefix.to_vec();
+            full_path.push(r.ident.to_string());
+            if let Some(file) = resolve_path_to_file(&full_path, current_file) {
+                if file.is_file() {
+                    results.push(file);
+                }
+            }
+            if !prefix.is_empty() {
+                if let Some(file) = resolve_path_to_file(prefix, current_file) {
+                    if file.is_file() {
+                        results.push(file);
+                    }
+                }
+            }
+        }
+        UseTree::Glob(_) => {
+            // Can't enumerate a glob without reading the target.
+        }
+        UseTree::Group(g) => {
+            for item in &g.items {
+                collect_from_tree(item, prefix, current_file, results);
+            }
+        }
+    }
 }
 
 fn source_file_of_span(span: &Span) -> Option<PathBuf> {
@@ -61,13 +169,17 @@ fn find_named_fields_in_file(
     type_name: &Ident,
     visited: &mut Vec<String>,
 ) -> Option<HashSet<Ident>> {
-    let key = format!("{}::{}", file_path.display(), mod_path);
+    // The visited key includes the type_name so that we can recurse into the
+    // same file looking for a *different* type (e.g. when following a type
+    // alias like `pub type MemberUser = Model;`). Without the type_name in
+    // the key, the recursion would be cut short.
+    let key = format!("{}::{}::{}", file_path.display(), mod_path, type_name);
     if visited.contains(&key) {
         return None;
     }
     visited.push(key);
 
-    // First pass: look for a struct/enum with the matching name in this file.
+    // First pass: look for a struct/enum/type-alias with the matching name in this file.
     for item in &file.items {
         match item {
             Item::Struct(s) if s.ident == *type_name => {
@@ -82,6 +194,31 @@ fn find_named_fields_in_file(
                     set.insert(v.ident.clone());
                 }
                 return Some(set);
+            }
+            Item::Type(t) if t.ident == *type_name => {
+                // Type alias: e.g. `pub type MemberUser = Model;`. Follow the
+                // alias to the underlying type. The underlying type is most
+                // often a path that resolves to a struct in the same file
+                // (e.g. `Model` or `Entity::Model`). We recurse on the alias
+                // target's last segment; if that fails we fall through to the
+                // next pass and the `..Default::default()` fallback in
+                // `derive_struct_into` will save us.
+                if let syn::Type::Path(target_path) = &*t.ty {
+                    if let Some(last_seg) = target_path.path.segments.last() {
+                        let target_ident = last_seg.ident.clone();
+                        if target_ident != *type_name {
+                            if let Some(fields) = find_named_fields_in_file(
+                                file,
+                                file_path,
+                                mod_path,
+                                &target_ident,
+                                visited,
+                            ) {
+                                return Some(fields);
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }
