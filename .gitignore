@@ -109,3 +109,5 @@ Cargo.lock
 .env
 .vscode/launch.json
 debug.log
+
+.idea/

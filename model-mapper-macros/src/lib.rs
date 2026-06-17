@@ -1,3 +1,4 @@
+mod auto_skip;
 mod input;
 mod model_mapper;
 mod type_path_ext;

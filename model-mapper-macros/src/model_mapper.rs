@@ -8,11 +8,11 @@ use darling::{
 use heck::ToSnakeCase;
 use macro_field_utils::{FieldInfo, FieldsCollector, FieldsHelper, VariantsHelper};
 use proc_macro2::TokenStream;
-use proc_macro_error2::abort_if_dirty;
+use proc_macro_error2::{abort_if_dirty, emit_error};
 use quote::{format_ident, quote, ToTokens};
-use syn::{fold::Fold, parse_quote, visit::Visit};
+use syn::{fold::Fold, parse_quote, visit::Visit, spanned::Spanned};
 
-use crate::{input::*, type_path_ext::*};
+use crate::{auto_skip, input::*, type_path_ext::*};
 
 pub(crate) fn r#impl(input: syn::DeriveInput) -> TokenStream {
     // Parse input
@@ -125,6 +125,45 @@ fn derive_enum(
     output
 }
 
+/// If `auto_skip` is set on the derive, resolve the field set of the other
+/// type from its source file and return the set of self field idents that do
+/// NOT exist on the other type. When `auto_skip` is not set, returns an empty
+/// set.
+fn auto_skip_idents(
+    derive: &ItemInput,
+    struct_fields: &Fields<FieldReceiver>,
+    other_ty: &syn::TypePath,
+) -> HashSet<syn::Ident> {
+    if !derive.auto_skip.is_present() {
+        return HashSet::new();
+    }
+
+    let Some(other_fields) = auto_skip::discover_other_type_fields(other_ty) else {
+        // Surface a clear error: we promised auto-skip, but couldn't resolve
+        // the other type's source.
+        emit_error!(
+            other_ty.span(),
+            "`auto_skip` is enabled but the source file of `{}` could not be \
+             resolved. Make sure the type is defined in the current crate and \
+             reachable via a `use` statement, or remove `auto_skip`.",
+            other_ty.to_token_stream()
+        );
+        return HashSet::new();
+    };
+
+    struct_fields
+        .iter()
+        .filter_map(|f| {
+            let ident = f.ident.as_ref()?;
+            if !other_fields.contains(ident) {
+                Some(ident.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn derive_struct_from(
     from: &SpannedValue<Override<DeriveInput>>,
     ident: &syn::Ident,
@@ -160,19 +199,38 @@ fn derive_struct_from(
     // In patterns we must not use generics
     let from_ty = strip_generics(&from_ty_with_generics);
 
+    // Compute the set of self fields that don't exist on the other type
+    // (only when `auto_skip` is enabled).
+    let extra_skip = auto_skip_idents(derive, struct_fields, original_from_ty);
+
     // The other type has
     let from_ty_fields_helper = FieldsHelper::new(struct_fields)
         // every non-skipped field of self
-        .filtering(|_ix, f| f.skip_for(original_from_ty).is_none())
+        .filtering(|_ix, f| {
+            f.skip_for(original_from_ty).is_none()
+                // For named fields, skip those that don't exist on the other
+                // type. Tuple fields are matched positionally and the auto-skip
+                // discovery is name-based, so we leave them alone.
+                && f.ident
+                    .as_ref()
+                    .map(|i| !extra_skip.contains(i))
+                    .unwrap_or(true)
+        })
         // every additional field explicitly set
         .extra_fields(derive.add.iter().map(|f| f.field.as_ref()))
         // any other field ignored, if set
-        .ignore_all_extra(derive.ignore_extra.is_present());
+        .ignore_all_extra(derive.ignore_extra.is_present() || !extra_skip.is_empty());
 
     // Self type has
     let into_ty_fields_helper = FieldsHelper::new(struct_fields)
         // every non-skipped field (as it's on the from)
-        .filtering(|_ix, f| f.skip_for(original_from_ty).is_none())
+        .filtering(|_ix, f| {
+            f.skip_for(original_from_ty).is_none()
+                && f.ident
+                    .as_ref()
+                    .map(|i| !extra_skip.contains(i))
+                    .unwrap_or(true)
+        })
         // skipped fields with the custom value provided
         .extra_fields_with(
             struct_fields
@@ -205,7 +263,9 @@ fn derive_struct_from(
                         )
                     })
                 }),
-        );
+        )
+        // add fields that don't exist on the other type back as `field: Default::default()`
+        .extra_default_fields(extra_skip.iter());
 
     // Deconstruct the `from` input to retrieve the inner fields
     let deconstructed_from = from_ty_fields_helper
@@ -385,13 +445,23 @@ fn derive_struct_into(
     // In patterns we must not use generics
     let into_ty = strip_generics(&into_ty_with_generics);
 
+    // Compute the set of self fields that don't exist on the other type
+    // (only when `auto_skip` is enabled).
+    let extra_skip = auto_skip_idents(derive, struct_fields, original_into_ty);
+
     // Self type has every field (whether it's used or not)
     let from_ty_fields_helper = FieldsHelper::new(struct_fields);
 
     // The other type has
     let into_ty_fields_helper = FieldsHelper::new(struct_fields)
         // every non-skipped field
-        .filtering(|_ix, f| f.skip_for(original_into_ty).is_none())
+        .filtering(|_ix, f| {
+            f.skip_for(original_into_ty).is_none()
+                && f.ident
+                    .as_ref()
+                    .map(|i| !extra_skip.contains(i))
+                    .unwrap_or(true)
+        })
         // every additional field explicitly set
         .extra_fields_with(derive.add.iter().map(|i| {
             let field = i.field.as_ref();
@@ -412,7 +482,7 @@ fn derive_struct_into(
             )
         }))
         // any other ignored field, with the default value
-        .include_all_default(derive.ignore_extra.is_present());
+        .include_all_default(derive.ignore_extra.is_present() || !extra_skip.is_empty());
 
     // Deconstruct the `from` input to retrieve the inner fields
     let deconstructed_from = from_ty_fields_helper

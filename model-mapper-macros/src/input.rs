@@ -47,6 +47,15 @@ pub(super) struct MapperOpts {
     /// Whether to ignore all extra fields/variants of the other type
     #[darling(default)]
     ignore_extra: SpannedValue<Flag>,
+    /// Whether to automatically detect fields that exist on the `ty` type and skip
+    /// fields on self that don't exist on `ty` (and vice versa).
+    ///
+    /// When enabled, the macro will read the source file of the `ty` type and
+    /// inspect its actual field names. Any field present on self but missing on
+    /// `ty` (or vice versa) will be skipped, using `Default::default()` for the
+    /// missing side.
+    #[darling(default)]
+    auto_skip: SpannedValue<Flag>,
 }
 
 #[derive(Debug, FromMeta, Clone)]
@@ -72,6 +81,10 @@ pub(super) struct ItemInput {
     /// Whether to ignore all extra fields/variants of the other type
     #[darling(default)]
     pub(super) ignore_extra: SpannedValue<Flag>,
+    /// Whether to automatically detect fields of `ty` and skip fields missing on
+    /// either side.
+    #[darling(default)]
+    pub(super) auto_skip: SpannedValue<Flag>,
 }
 
 #[derive(Debug, FromVariant, Clone)]
@@ -304,6 +317,7 @@ impl MapperOpts {
                 try_into: self.try_into.clone(),
                 ignore_extra: self.ignore_extra,
                 add: self.add.clone(),
+                auto_skip: self.auto_skip,
             }]
         } else {
             // If there are no derives, abort
