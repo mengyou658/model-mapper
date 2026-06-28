@@ -2,12 +2,13 @@
 //! names. Used by the `auto_skip` feature to detect fields that exist on the
 //! other type but not on self (or vice versa).
 
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+};
 
 use proc_macro2::Span;
-use syn::spanned::Spanned;
-use syn::{Fields, Ident, Item, ItemUse, TypePath, UseTree};
+use syn::{Fields, Ident, Item, ItemUse, TypePath, UseTree, spanned::Spanned};
 
 /// Attempt to discover the named fields of the struct/enum referenced by `ty`
 /// by reading the source file where the type was referenced and following any
@@ -40,13 +41,7 @@ pub(super) fn discover_other_type_field_info(ty: &TypePath) -> Option<HashMap<Id
     // Step 4: first, look for the type in the current file (handles inline
     // modules and the trivial case where the type lives next to the
     // `#[mapper]` call).
-    if let Some(info) = find_named_fields_with_types_in_file(
-        &origin,
-        &origin_file,
-        "",
-        &type_name,
-        &mut Vec::new(),
-    ) {
+    if let Some(info) = find_named_fields_with_types_in_file(&origin, &origin_file, "", &type_name, &mut Vec::new()) {
         return Some(info);
     }
 
@@ -61,13 +56,9 @@ pub(super) fn discover_other_type_field_info(ty: &TypePath) -> Option<HashMap<Id
         if let Item::Use(use_stmt) = item {
             for resolved_file in collect_resolved_files(use_stmt, &origin_file) {
                 if let Some(content) = read_and_parse(&resolved_file) {
-                    if let Some(info) = find_named_fields_with_types_in_file(
-                        &content,
-                        &resolved_file,
-                        "",
-                        &type_name,
-                        &mut Vec::new(),
-                    ) {
+                    if let Some(info) =
+                        find_named_fields_with_types_in_file(&content, &resolved_file, "", &type_name, &mut Vec::new())
+                    {
                         return Some(info);
                     }
                 }
@@ -81,13 +72,9 @@ pub(super) fn discover_other_type_field_info(ty: &TypePath) -> Option<HashMap<Id
     // `Model` field-for-field, so we can fall back to `Model`'s definition.
     if let Some(stripped) = type_name.to_string().strip_suffix("Ex") {
         if let Ok(alt_ident) = syn::parse_str::<Ident>(stripped) {
-            if let Some(info) = find_named_fields_with_types_in_file(
-                &origin,
-                &origin_file,
-                "",
-                &alt_ident,
-                &mut Vec::new(),
-            ) {
+            if let Some(info) =
+                find_named_fields_with_types_in_file(&origin, &origin_file, "", &alt_ident, &mut Vec::new())
+            {
                 return Some(info);
             }
             for item in &origin.items {
@@ -122,12 +109,7 @@ fn collect_resolved_files(use_stmt: &ItemUse, current_file: &Path) -> Vec<PathBu
     results
 }
 
-fn collect_from_tree(
-    tree: &UseTree,
-    prefix: &[String],
-    current_file: &Path,
-    results: &mut Vec<PathBuf>,
-) {
+fn collect_from_tree(tree: &UseTree, prefix: &[String], current_file: &Path, results: &mut Vec<PathBuf>) {
     match tree {
         UseTree::Path(p) => {
             let mut new_prefix = prefix.to_vec();
@@ -137,15 +119,12 @@ fn collect_from_tree(
         UseTree::Name(n) => {
             // The leaf is a type/value being imported. Try two strategies:
             //
-            // 1. Resolve the full path as a module (e.g. `use crate::foo::bar;`
-            //    re-exports a sub-module). This is mostly relevant for glob
-            //    re-exports like `pub use self::foo::*;` (handled elsewhere)
-            //    and grouped uses with explicit module paths.
-            // 2. Resolve the *prefix* (everything before the leaf) as a module
-            //    file, then look for the type inside that file. This handles
-            //    the common pattern `use crate::entity::foo::Model;` where
-            //    `Model` is a type/struct/enum/type-alias inside `foo.rs`,
-            //    not a module of its own.
+            // 1. Resolve the full path as a module (e.g. `use crate::foo::bar;` re-exports a sub-module). This is
+            //    mostly relevant for glob re-exports like `pub use self::foo::*;` (handled elsewhere) and grouped uses
+            //    with explicit module paths.
+            // 2. Resolve the *prefix* (everything before the leaf) as a module file, then look for the type inside that
+            //    file. This handles the common pattern `use crate::entity::foo::Model;` where `Model` is a
+            //    type/struct/enum/type-alias inside `foo.rs`, not a module of its own.
             let mut full_path = prefix.to_vec();
             full_path.push(n.ident.to_string());
             if let Some(file) = resolve_path_to_file(&full_path, current_file) {
@@ -259,13 +238,9 @@ fn find_named_fields_in_file(
                     if let Some(last_seg) = target_path.path.segments.last() {
                         let target_ident = last_seg.ident.clone();
                         if target_ident != *type_name {
-                            if let Some(fields) = find_named_fields_in_file(
-                                file,
-                                file_path,
-                                mod_path,
-                                &target_ident,
-                                visited,
-                            ) {
+                            if let Some(fields) =
+                                find_named_fields_in_file(file, file_path, mod_path, &target_ident, visited)
+                            {
                                 return Some(fields);
                             }
                         }
@@ -291,13 +266,7 @@ fn find_named_fields_in_file(
                 } else {
                     format!("{}::{}", mod_path, m.ident)
                 };
-                if let Some(fields) = find_named_fields_in_file(
-                    &nested,
-                    file_path,
-                    &nested_path,
-                    type_name,
-                    visited,
-                ) {
+                if let Some(fields) = find_named_fields_in_file(&nested, file_path, &nested_path, type_name, visited) {
                     return Some(fields);
                 }
             }
@@ -309,13 +278,7 @@ fn find_named_fields_in_file(
         if let Item::Use(use_stmt) = item {
             if let Some(resolved) = resolve_use_for_type(use_stmt, type_name, file_path) {
                 if let Some(content) = read_and_parse(&resolved) {
-                    if let Some(fields) = find_named_fields_in_file(
-                        &content,
-                        &resolved,
-                        "",
-                        type_name,
-                        visited,
-                    ) {
+                    if let Some(fields) = find_named_fields_in_file(&content, &resolved, "", type_name, visited) {
                         return Some(fields);
                     }
                 }
@@ -385,13 +348,9 @@ fn find_named_fields_with_types_in_file(
                     if let Some(last_seg) = target_path.path.segments.last() {
                         let target_ident = last_seg.ident.clone();
                         if target_ident != *type_name {
-                            if let Some(fields) = find_named_fields_with_types_in_file(
-                                file,
-                                file_path,
-                                mod_path,
-                                &target_ident,
-                                visited,
-                            ) {
+                            if let Some(fields) =
+                                find_named_fields_with_types_in_file(file, file_path, mod_path, &target_ident, visited)
+                            {
                                 return Some(fields);
                             }
                         }
@@ -416,13 +375,9 @@ fn find_named_fields_with_types_in_file(
                 } else {
                     format!("{}::{}", mod_path, m.ident)
                 };
-                if let Some(fields) = find_named_fields_with_types_in_file(
-                    &nested,
-                    file_path,
-                    &nested_path,
-                    type_name,
-                    visited,
-                ) {
+                if let Some(fields) =
+                    find_named_fields_with_types_in_file(&nested, file_path, &nested_path, type_name, visited)
+                {
                     return Some(fields);
                 }
             }
@@ -434,13 +389,9 @@ fn find_named_fields_with_types_in_file(
         if let Item::Use(use_stmt) = item {
             if let Some(resolved) = resolve_use_for_type(use_stmt, type_name, file_path) {
                 if let Some(content) = read_and_parse(&resolved) {
-                    if let Some(fields) = find_named_fields_with_types_in_file(
-                        &content,
-                        &resolved,
-                        "",
-                        type_name,
-                        visited,
-                    ) {
+                    if let Some(fields) =
+                        find_named_fields_with_types_in_file(&content, &resolved, "", type_name, visited)
+                    {
                         return Some(fields);
                     }
                 }
@@ -465,23 +416,14 @@ fn extract_named_fields_with_types(fields: &Fields) -> HashMap<Ident, syn::Type>
 
 /// If `use_stmt` re-exports `type_name` (possibly as one of many in a group),
 /// return the resolved file path that actually defines the type.
-fn resolve_use_for_type(
-    use_stmt: &ItemUse,
-    type_name: &Ident,
-    current_file: &Path,
-) -> Option<PathBuf> {
+fn resolve_use_for_type(use_stmt: &ItemUse, type_name: &Ident, current_file: &Path) -> Option<PathBuf> {
     // Only consider absolute paths starting with `crate::`, `::crate::`,
     // `super::`, `self::`, or external crate names.
     let tree = &use_stmt.tree;
     resolve_tree(tree, &[], type_name, current_file)
 }
 
-fn resolve_tree(
-    tree: &UseTree,
-    prefix: &[String],
-    type_name: &Ident,
-    current_file: &Path,
-) -> Option<PathBuf> {
+fn resolve_tree(tree: &UseTree, prefix: &[String], type_name: &Ident, current_file: &Path) -> Option<PathBuf> {
     match tree {
         UseTree::Path(p) => {
             let mut new_prefix = prefix.to_vec();

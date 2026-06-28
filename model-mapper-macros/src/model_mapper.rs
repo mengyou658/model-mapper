@@ -1,16 +1,16 @@
 use std::collections::{HashMap, HashSet};
 
 use darling::{
+    FromDeriveInput,
     ast::{Data, Fields},
     util::{Override, SpannedValue},
-    FromDeriveInput,
 };
 use heck::ToSnakeCase;
 use macro_field_utils::{FieldInfo, FieldsCollector, FieldsHelper, VariantsHelper};
-use proc_macro2::TokenStream;
 use proc_macro_error2::{abort_if_dirty, emit_error};
-use quote::{format_ident, quote, ToTokens};
-use syn::{fold::Fold, parse_quote, visit::Visit, spanned::Spanned};
+use proc_macro2::TokenStream;
+use quote::{ToTokens, format_ident, quote};
+use syn::{fold::Fold, parse_quote, spanned::Spanned, visit::Visit};
 
 use crate::{auto_skip, input::*, type_path_ext::*};
 
@@ -165,9 +165,8 @@ fn auto_skip_idents(
         // the other type's source.
         emit_error!(
             other_ty.span(),
-            "`auto_skip` is enabled but the source file of `{}` could not be \
-             resolved. Make sure the type is defined in the current crate and \
-             reachable via a `use` statement, or remove `auto_skip`.",
+            "`auto_skip` is enabled but the source file of `{}` could not be resolved. Make sure the type is defined \
+             in the current crate and reachable via a `use` statement, or remove `auto_skip`.",
             other_ty.to_token_stream()
         );
         return AutoSkipFields {
@@ -179,10 +178,7 @@ fn auto_skip_idents(
 
     // Collect the set of self field idents for fast lookup of the other_extra
     // set.
-    let self_idents: HashSet<&syn::Ident> = struct_fields
-        .iter()
-        .filter_map(|f| f.ident.as_ref())
-        .collect();
+    let self_idents: HashSet<&syn::Ident> = struct_fields.iter().filter_map(|f| f.ident.as_ref()).collect();
 
     let self_extra = self_idents
         .iter()
@@ -293,8 +289,15 @@ fn derive_struct_from(
         .extra_fields(derive.add.iter().map(|f| f.field.as_ref()))
         // any other field ignored, if set. The auto-skip case is also
         // covered: if any field exists only on the other side, the from
-        // pattern needs `..` to swallow it.
-        .ignore_all_extra(derive.ignore_extra.is_present() || !self_extra.is_empty() || !other_extra.is_empty());
+        // pattern needs `..` to swallow it. When `auto_skip` is enabled we
+        // always append `..` because `#[sea_orm::model]` may add inaccessible
+        // compiler-generated fields not visible in the source file.
+        .ignore_all_extra(
+            derive.ignore_extra.is_present()
+                || derive.auto_skip.is_present()
+                || !self_extra.is_empty()
+                || !other_extra.is_empty(),
+        );
 
     // Self type has
     let into_ty_fields_helper = FieldsHelper::new(struct_fields)
@@ -429,7 +432,8 @@ fn derive_struct_from(
 
         // Implement the custom function
         if is_try {
-            let (trait_error_ty, is_accumulate, custom_accumulator, err_ty) = get_error_and_accumulate_info(Override::as_ref(from).explicit());
+            let (trait_error_ty, is_accumulate, custom_accumulator, err_ty) =
+                get_error_and_accumulate_info(Override::as_ref(from).explicit());
             let try_body = build_try_body(
                 true,
                 original_from_ty,
@@ -467,7 +471,8 @@ fn derive_struct_from(
             )
         }
     } else if is_try {
-        let (trait_error_ty, is_accumulate, custom_accumulator, err_ty) = get_error_and_accumulate_info(Override::as_ref(from).explicit());
+        let (trait_error_ty, is_accumulate, custom_accumulator, err_ty) =
+            get_error_and_accumulate_info(Override::as_ref(from).explicit());
         let try_body = build_try_body(
             true,
             original_from_ty,
@@ -671,7 +676,8 @@ fn derive_struct_into(
 
         // Implement the custom function
         if is_try {
-            let (trait_error_ty, is_accumulate, custom_accumulator, err_ty) = get_error_and_accumulate_info(Override::as_ref(into).explicit());
+            let (trait_error_ty, is_accumulate, custom_accumulator, err_ty) =
+                get_error_and_accumulate_info(Override::as_ref(into).explicit());
             let try_body = build_try_body(
                 false,
                 original_into_ty,
@@ -709,7 +715,8 @@ fn derive_struct_into(
             )
         }
     } else if is_try {
-        let (trait_error_ty, is_accumulate, custom_accumulator, err_ty) = get_error_and_accumulate_info(Override::as_ref(into).explicit());
+        let (trait_error_ty, is_accumulate, custom_accumulator, err_ty) =
+            get_error_and_accumulate_info(Override::as_ref(into).explicit());
         let try_body = build_try_body(
             false,
             original_into_ty,
